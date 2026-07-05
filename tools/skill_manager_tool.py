@@ -58,6 +58,17 @@ try:
 except ImportError:
     _LINTER_AVAILABLE = False
 
+# ── Skills SAST — static security analysis on create/edit/patch ────────────
+try:
+    from tools.skills_sast import (
+        scan_skill as _sast_scan_skill,
+        has_errors as _sast_has_errors,
+        format_report as _sast_format_report,
+    )
+    _SAST_AVAILABLE = True
+except ImportError:
+    _SAST_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 _background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
@@ -819,6 +830,45 @@ def _run_lint_check(
         logger.warning("Skills linter failed during %s: %s", action_label, e, exc_info=True)
     return None
 
+
+def _run_sast_scan(
+    content: str,
+    skill_name: Optional[str] = None,
+    action_label: str = "write",
+) -> Optional[Dict[str, Any]]:
+    """Run SAST (static security analysis) on skill content.
+
+    Returns an error dict (success=False) if critical or high severity issues
+    are found, or None if the content passes security checks (or the scanner
+    is unavailable).
+
+    Medium/low issues are reported via logger.warning but do NOT block.
+    """
+    if not _SAST_AVAILABLE:
+        return None
+    try:
+        issues = _sast_scan_skill(content, skill_name=skill_name)
+        if _sast_has_errors(issues):
+            report = _sast_format_report(issues)
+            return {
+                "success": False,
+                "error": (
+                    f"Cannot {action_label} skill: security validation failed. "
+                    f"Fix the issues below and retry:\n\n{report}"
+                ),
+            }
+        # Medium/low issues are advisory only — log them but don't block
+        if issues:
+            report = _sast_format_report(issues)
+            logger.warning(
+                "SAST advisory for skill '%s' during %s:\n%s",
+                skill_name or "<unknown>", action_label, report,
+            )
+    except Exception as e:
+        logger.warning("Skills SAST failed during %s: %s", action_label, e, exc_info=True)
+    return None
+
+
 def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
     """Create a new user skill with SKILL.md content."""
     # Validate name
@@ -843,6 +893,11 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     lint_err = _run_lint_check(content, skill_name=name, action_label="create")
     if lint_err:
         return lint_err
+
+    # SAST scan (security) — after lint
+    sast_err = _run_sast_scan(content, skill_name=name, action_label="create")
+    if sast_err:
+        return sast_err
 
     # Check for name collisions across all directories
     existing = _find_skill(name)
@@ -906,6 +961,11 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     lint_err = _run_lint_check(content, skill_name=name, action_label="edit")
     if lint_err:
         return lint_err
+
+    # SAST scan (security) — after lint
+    sast_err = _run_sast_scan(content, skill_name=name, action_label="edit")
+    if sast_err:
+        return sast_err
 
     existing = _find_skill(name)
     if not existing:
@@ -1051,6 +1111,11 @@ def _patch_skill(
         )
         if lint_err:
             return lint_err
+
+        # SAST scan (security) — after lint (SKILL.md patches only)
+        sast_err = _run_sast_scan(new_content, skill_name=name, action_label="patch")
+        if sast_err:
+            return sast_err
 
     original_content = content  # for rollback
     _atomic_write_text(target, new_content)
