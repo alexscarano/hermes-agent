@@ -18,6 +18,7 @@ from tools.file_operations import (
 )
 from tools import file_state
 from agent.redact import redact_sensitive_text
+from hermes_cli.history import snapshot_before, snapshot_after
 
 logger = logging.getLogger(__name__)
 
@@ -1607,6 +1608,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # subagents can't interleave on the same file.  Different paths
         # remain fully parallel.
         with file_state.lock_path(_resolved):
+            # Snapshot BEFORE write
+            _sid = snapshot_before(_resolved, operation="write_file")
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
@@ -1627,6 +1630,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             if not result_dict.get("error"):
                 result_dict["files_modified"] = [_resolved]
                 _mark_verification_stale(task_id, [_resolved], session_id=session_id)
+                # Snapshot AFTER successful write
+                snapshot_after(_resolved, _sid, operation="write_file")
             # Refresh stamps after the successful write so consecutive
             # writes by this task don't trigger false staleness warnings.
             _update_read_timestamp(path, task_id)
