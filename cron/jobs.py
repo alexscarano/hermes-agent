@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
 from utils import atomic_replace
+from cron.sensors import check_sensor, is_sensor_schedule, get_sensor_config, get_sensor_cooldown
 
 try:
     from croniter import croniter
@@ -292,6 +293,79 @@ def ensure_dirs():
 # Schedule Parsing
 # =============================================================================
 
+_SENSOR_OP_RE = r'(>=|<=|==|!=|>|<)'
+_SENSOR_THRESHOLD_RE = r'(-?\d+(?:\.\d+)?)'
+
+
+def _parse_sensor_number(s: str) -> Union[int, float]:
+    """Parse a threshold string as int when whole, else float."""
+    try:
+        return int(s)
+    except ValueError:
+        return float(s)
+
+
+def _parse_sensor_schedule(remainder: str, original: str) -> Dict[str, Any]:
+    """Parse the part of a schedule string after the 'sensor:' prefix.
+
+    See parse_schedule() for the supported formats.
+    """
+    head, _sep, tail = remainder.partition(":")
+
+    # Matched against the full remainder (not `head`) so a trailing ":..."
+    # segment is rejected instead of silently dropped.
+    m = re.match(rf'^(cpu|memory){_SENSOR_OP_RE}{_SENSOR_THRESHOLD_RE}$', remainder)
+    if m:
+        sensor_type, operator, threshold = m.groups()
+        params = {"operator": operator, "threshold": _parse_sensor_number(threshold)}
+    elif head == "disk":
+        m = re.match(rf'^(.+?){_SENSOR_OP_RE}{_SENSOR_THRESHOLD_RE}$', tail)
+        if not m:
+            raise ValueError(
+                f"Invalid disk sensor schedule 'sensor:{remainder}'. "
+                f"Use format like 'sensor:disk:/home>90'"
+            )
+        path, operator, threshold = m.groups()
+        sensor_type = "disk"
+        params = {"path": path, "operator": operator, "threshold": _parse_sensor_number(threshold)}
+    elif head == "network":
+        if not tail:
+            raise ValueError(
+                f"Invalid network sensor schedule 'sensor:{remainder}'. "
+                f"Use format like 'sensor:network:8.8.8.8'"
+            )
+        sensor_type = "network"
+        params = {"host": tail}
+    elif head == "file":
+        if not tail:
+            raise ValueError(
+                f"Invalid file sensor schedule 'sensor:{remainder}'. "
+                f"Use format like 'sensor:file:/tmp/watch'"
+            )
+        sensor_type = "file"
+        params = {"path": tail}
+    elif head == "process":
+        if not tail:
+            raise ValueError(
+                f"Invalid process sensor schedule 'sensor:{remainder}'. "
+                f"Use format like 'sensor:process:nginx'"
+            )
+        sensor_type = "process"
+        params = {"name": tail}
+    else:
+        raise ValueError(
+            f"Unknown sensor type in 'sensor:{remainder}'. "
+            f"Supported: cpu, memory, disk, network, file, process"
+        )
+
+    return {
+        "kind": "sensor",
+        "sensor": {"type": sensor_type, "params": params},
+        "cooldown": 300,
+        "display": original,
+    }
+
+
 def parse_duration(s: str) -> int:
     """
     Parse duration string into minutes.
@@ -403,13 +477,19 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         }
     except ValueError:
         pass
-    
+
+    # sensor:<type>[:<param>] → reactive trigger (see _parse_sensor_schedule)
+    if original.startswith("sensor:"):
+        return _parse_sensor_schedule(original[len("sensor:"):], original)
+
     raise ValueError(
         f"Invalid schedule '{original}'. Use:\n"
         f"  - Duration: '30m', '2h', '1d' (one-shot)\n"
         f"  - Interval: 'every 30m', 'every 2h' (recurring)\n"
         f"  - Cron: '0 9 * * *' (cron expression)\n"
-        f"  - Timestamp: '2026-02-03T14:00:00' (one-shot at time)"
+        f"  - Timestamp: '2026-02-03T14:00:00' (one-shot at time)\n"
+        f"  - Sensor: 'sensor:cpu>80', 'sensor:disk:/home>90', "
+        f"'sensor:network:8.8.8.8', 'sensor:file:/tmp/watch', 'sensor:process:nginx'"
     )
 
 
@@ -523,6 +603,11 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
     Returns ISO timestamp string, or None if no more runs.
     """
     now = _hermes_now()
+
+    if is_sensor_schedule(schedule):
+        # Sensors have no predictable "next run" — cooldown is tracked via
+        # last_run_at in _get_due_jobs_locked() / mark_job_run() instead.
+        return None
 
     if schedule["kind"] == "once":
         return _recoverable_oneshot_run_at(schedule, now, last_run_at=last_run_at)
@@ -1248,7 +1333,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
-                now = _hermes_now().isoformat()
+                now_dt = _hermes_now()
+                now = now_dt.isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
@@ -1285,8 +1371,13 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         save_jobs(jobs)
                         return
                 
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                # Compute next run. Sensor jobs have no predictable next run
+                # (compute_next_run returns None for them) — cooldown instead.
+                if is_sensor_schedule(job.get("schedule", {})):
+                    cooldown = get_sensor_cooldown(job["schedule"])
+                    job["next_run_at"] = (now_dt + timedelta(seconds=cooldown)).isoformat()
+                else:
+                    job["next_run_at"] = compute_next_run(job["schedule"], now)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -1510,9 +1601,38 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         if not job.get("enabled", True):
             continue
 
+        schedule = job.get("schedule", {})
+        if is_sensor_schedule(schedule):
+            cooldown = get_sensor_cooldown(schedule)
+            last_run_at = job.get("last_run_at")
+            if last_run_at:
+                last_run_dt = _ensure_aware(datetime.fromisoformat(last_run_at))
+                if last_run_dt + timedelta(seconds=cooldown) > now:
+                    continue  # cooldown still in effect
+            sensor_config = get_sensor_config(schedule) or {}
+            try:
+                triggered = check_sensor(sensor_config["type"], sensor_config.get("params", {}))
+            except (KeyError, ValueError) as e:
+                # Malformed job (e.g. hand-edited jobs.json) or a sensor type
+                # that's no longer registered — skip this job, don't abort the
+                # whole tick's due-job scan for every other job (#see review).
+                logger.warning(
+                    "Job '%s': invalid sensor config %r (%s) — skipping",
+                    job.get("name", job["id"]), sensor_config, e,
+                )
+                continue
+            if triggered:
+                job["next_run_at"] = (now + timedelta(seconds=cooldown)).isoformat()
+                for rj in raw_jobs:
+                    if rj["id"] == job["id"]:
+                        rj["next_run_at"] = job["next_run_at"]
+                        needs_save = True
+                        break
+                due.append(job)
+            continue
+
         next_run = job.get("next_run_at")
         if not next_run:
-            schedule = job.get("schedule", {})
             kind = schedule.get("kind")
 
             # One-shot jobs use a small grace window via the dedicated helper.
@@ -1551,7 +1671,6 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     break
 
         raw_next_run_dt = datetime.fromisoformat(next_run)
-        schedule = job.get("schedule", {})
         kind = schedule.get("kind")
 
         next_run_dt = _ensure_aware(raw_next_run_dt)
