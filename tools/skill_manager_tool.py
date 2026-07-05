@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_constants import get_hermes_home, display_hermes_home
 from utils import atomic_replace, is_truthy_value
 from hermes_cli.config import cfg_get
+from hermes_cli.history import snapshot_before, snapshot_after
 
 logger = logging.getLogger(__name__)
 
@@ -740,16 +741,18 @@ def _resolve_skill_target(skill_dir: Path, file_path: str) -> Tuple[Optional[Pat
 def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
     """
     Atomically write text content to a file.
-    
+
     Uses a temporary file in the same directory and os.replace() to ensure
     the target file is never left in a partially-written state if the process
     crashes or is interrupted.
-    
+
     Args:
         file_path: Target file path
         content: Content to write
         encoding: Text encoding (default: utf-8)
     """
+    # Snapshot before write (if file already exists)
+    sid = snapshot_before(str(file_path), operation="skill_manage")
     file_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(
         dir=str(file_path.parent),
@@ -767,6 +770,8 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
         except OSError:
             logger.error("Failed to remove temporary file %s during atomic write", temp_path, exc_info=True)
         raise
+    # Snapshot after successful write
+    snapshot_after(str(file_path), sid, operation="skill_manage")
 
 
 # =============================================================================
