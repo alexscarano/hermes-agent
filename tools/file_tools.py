@@ -1733,6 +1733,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             for _r in _resolved_paths:
                 _locks.enter_context(file_state.lock_path(_r))
 
+            # Snapshot all paths BEFORE patch
+            _patch_sid_map: dict[str, str | None] = {}
+            for _rp in _resolved_paths:
+                _patch_sid_map[_rp] = snapshot_before(_rp, operation="patch")
+
             # Collect warnings — cross-agent registry first (names sibling),
             # then per-task tracker as a fallback.
             stale_warnings: list[str] = []
@@ -1800,6 +1805,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 _reset_patch_failures(task_id, [
                     _r for _r in (_path_to_resolved.get(_p) for _p in _paths_to_check) if _r
                 ])
+                # Snapshot all paths AFTER successful patch
+                for _rp in _resolved_paths:
+                    _sid = _patch_sid_map.get(_rp)
+                    if _sid:
+                        snapshot_after(_rp, _sid, operation="patch")
         # Hint when old_string not found — saves iterations where the agent
         # retries with stale content instead of re-reading the file.
         # Suppressed when patch_replace already attached a rich "Did you mean?"
