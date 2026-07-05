@@ -1268,6 +1268,15 @@ DEFAULT_CONFIG = {
         "min_interval_hours": 24,
     },
 
+    # .hermes-history snapshot system — silent file versioning before every
+    # write_file and patch operation.  Use ``hermes history rollback`` to
+    # restore.
+    "history": {
+        "enabled": True,
+        "max_snapshots": 100,
+        "keep_days": 30,
+    },
+
     # Hard cap (chars) for a single automatic context file such as SOUL.md,
     # AGENTS.md, CLAUDE.md, .hermes.md, or .cursorrules before Hermes applies
     # head/tail truncation. ``null`` (the default) lets the cap scale with the
