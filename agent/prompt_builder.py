@@ -328,6 +328,14 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+SELF_HEALING_GUIDANCE = (
+    "# Self-healing strategy switching\n"
+    "If you get a `[SELF-HEALING]` marker appended to a tool result, it means "
+    "you've been getting the same error repeatedly. Stop your current approach "
+    "immediately. Do NOT retry the same fix. Pause, describe a fundamentally "
+    "different root-cause theory, then try that instead.\n"
+)
+
 # Universal parallel-tool-call guidance — applied to ALL models.
 #
 # Why this matters for cost: every assistant turn resends the entire

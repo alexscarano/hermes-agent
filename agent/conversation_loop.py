@@ -79,6 +79,83 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+# ── Self-healing helpers ──────────────────────────────────────────────
+
+
+def _detect_consecutive_error(
+    messages: list,
+    last_signature: tuple | None,
+) -> tuple | None:
+    """Scan messages for the last tool result with an error.
+
+    Returns an error signature ``(tool_name, error_snippet)`` if the last
+    tool result had an error, or ``None`` if it succeeded.
+
+    The signature is compared against *last_signature* to detect repetition
+    — two calls with the same tool name and same error snippet are treated
+    as the same error.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        content = str(content).strip()
+        if not content:
+            return None
+
+        name = msg.get("name", "unknown")
+        has_error = False
+
+        # Terminal: non-zero exit code is the canonical failure signal
+        if name == "terminal":
+            try:
+                import json
+                data = json.loads(content)
+                if isinstance(data, dict):
+                    ec = data.get("exit_code")
+                    if ec is not None and ec != 0:
+                        has_error = True
+                        err = data.get("error", "") or ""
+                        snippet = err[:80] if err else f"[exit {ec}]"
+            except (json.JSONDecodeError, TypeError):
+                lower = content[:200].lower()
+                if "error" in lower or "failed" in lower or "traceback" in lower:
+                    has_error = True
+                    snippet = content[:80]
+        else:
+            lower = content[:500].lower()
+            has_error = (
+                '"error"' in lower
+                or '"failed"' in lower
+                or content.startswith("Error")
+            )
+            snippet = content[:80]
+
+        if not has_error:
+            return None
+
+        sig = (name, snippet)
+
+        if last_signature and sig == last_signature:
+            return sig
+        return sig
+
+    return None
+
+
+def _find_last_tool_message(messages: list) -> dict | None:
+    """Return the last tool-role message in *messages*, or None."""
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            return msg
+    return None
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -613,6 +690,10 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+
+    # Self-healing: consecutive same-error tracking
+    agent._last_error_signature = None   # (tool_name, error_snippet) or None
+    agent._consecutive_same_error_count = 0
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -4686,6 +4767,38 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                # ── Self-healing: detect repeated same errors ──────────
+                _same_error_limit = getattr(agent, "_same_error_retry_limit", 3)
+                if _same_error_limit > 0:
+                    _error_sig = _detect_consecutive_error(
+                        messages, agent._last_error_signature
+                    )
+                    if _error_sig is not None:
+                        agent._consecutive_same_error_count += 1
+                        agent._last_error_signature = _error_sig
+                        if agent._consecutive_same_error_count >= _same_error_limit:
+                            _tool_msg = _find_last_tool_message(messages)
+                            if _tool_msg:
+                                _healing = (
+                                    "\n\n[SELF-HEALING] This error has occurred "
+                                    f"{agent._consecutive_same_error_count} times in a row. "
+                                    "Stop your current approach. Do NOT retry the same fix. "
+                                    "Pause, describe a fundamentally different root-cause "
+                                    "theory, then try that instead."
+                                )
+                                _existing = _tool_msg.get("content", "")
+                                if isinstance(_existing, str):
+                                    _tool_msg["content"] = _existing + _healing
+                                    agent._vprint(
+                                        f"  ┊ Self-healing triggered after "
+                                        f"{agent._consecutive_same_error_count} consecutive "
+                                        f"same-error tool results"
+                                    )
+                            agent._consecutive_same_error_count = 0
+                    else:
+                        agent._consecutive_same_error_count = 0
+                        agent._last_error_signature = _error_sig
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision

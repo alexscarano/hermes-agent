@@ -35,6 +35,7 @@ from agent.prompt_builder import (
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
+    SELF_HEALING_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
@@ -183,6 +184,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # (default True) and only injected when tools are actually loaded.
     if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
+
+    # Universal self-healing guidance — tells the model to switch strategy
+    # after repeated same-error failures. Gated by config.yaml
+    # ``agent.same_error_retry_limit`` (default 3, 0 = disabled).
+    _same_error_limit = getattr(agent, "_same_error_retry_limit", 3)
+    if _same_error_limit > 0 and agent.valid_tool_names:
+        stable_parts.append(SELF_HEALING_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
