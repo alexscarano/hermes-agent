@@ -15,6 +15,8 @@ Design:
 """
 
 import json
+import os
+import time
 from typing import Dict, Any, List, Optional
 
 
@@ -38,6 +40,13 @@ MAX_TODO_RESULT_CHARS = 512_000
 _TRUNCATION_MARKER = "… [truncated]"
 
 
+# ponytail: simple file-based snapshot for crash recovery
+_SNAPSHOT_DIR = os.path.join(os.path.expanduser("~"), ".hermes", "state")
+_SNAPSHOT_PATH = os.path.join(_SNAPSHOT_DIR, "todo_snapshot.json")
+# ponytail: not a real TTL, just prevents week-old todos from polluting new sessions
+_SNAPSHOT_MAX_AGE_S = 6 * 3600
+
+
 class TodoStore:
     """
     In-memory todo list. One instance per AIAgent (one per session).
@@ -50,6 +59,33 @@ class TodoStore:
 
     def __init__(self):
         self._items: List[Dict[str, str]] = []
+        self._load_snapshot()
+
+    # ponytail: flat file, no lock, no sync. Single-agent sessions only.
+    def _snapshot_path(self) -> str:
+        return _SNAPSHOT_PATH
+
+    def _load_snapshot(self) -> None:
+        path = self._snapshot_path()
+        try:
+            st = os.stat(path)
+            if time.time() - st.st_mtime > _SNAPSHOT_MAX_AGE_S:
+                return
+            with open(path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self._items = [self._validate(i) for i in data]
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+
+    def _save_snapshot(self) -> None:
+        path = self._snapshot_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(self._items, f, indent=2)
+        except OSError:
+            pass
 
     def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, str]]:
         """
@@ -98,6 +134,7 @@ class TodoStore:
         # (list order is priority).
         if len(self._items) > MAX_TODO_ITEMS:
             self._items = self._items[:MAX_TODO_ITEMS]
+        self._save_snapshot()
         return self.read()
 
     def read(self) -> List[Dict[str, str]]:
@@ -328,3 +365,19 @@ registry.register(
     check_fn=check_todo_requirements,
     emoji="📋",
 )
+
+
+# ponytail: simple self-check — run `python3 tools/todo_tool.py` to verify
+if __name__ == "__main__":
+    path = TodoStore()._snapshot_path()
+    if os.path.exists(path):
+        os.remove(path)
+    s = TodoStore()
+    assert s.read() == []
+    s.write([{"id": "check", "content": "snapshot test", "status": "pending"}])
+    s2 = TodoStore()
+    items = s2.read()
+    assert len(items) == 1
+    assert items[0]["id"] == "check"
+    os.remove(path)
+    print(f"todo snapshot OK ({__file__})")
