@@ -1343,15 +1343,6 @@ DEFAULT_CONFIG = {
         "min_interval_hours": 24,
     },
 
-    # .hermes-history snapshot system — silent file versioning before every
-    # write_file and patch operation.  Use ``hermes history rollback`` to
-    # restore.
-    "history": {
-        "enabled": True,
-        "max_snapshots": 100,
-        "keep_days": 30,
-    },
-
     # Hard cap (chars) for a single automatic context file such as SOUL.md,
     # AGENTS.md, CLAUDE.md, .hermes.md, or .cursorrules before Hermes applies
     # head/tail truncation. ``null`` (the default) lets the cap scale with the
@@ -3541,6 +3532,14 @@ OPTIONAL_ENV_VARS = {
         "prompt": "GMI Cloud base URL (leave empty for default)",
         "url": None,
         "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "FIREWORKS_API_KEY": {
+        "description": "Fireworks AI API key",
+        "prompt": "Fireworks AI API key",
+        "url": "https://app.fireworks.ai/settings/users/api-keys",
+        "password": True,
         "category": "provider",
         "advanced": True,
     },

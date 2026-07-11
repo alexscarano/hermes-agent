@@ -46,31 +46,6 @@ from hermes_constants import get_hermes_home, display_hermes_home
 from utils import atomic_replace, is_truthy_value
 from hermes_cli.config import cfg_get
 
-# ── Skills linter — automatic validation on create/edit/write ───────────────
-try:
-    from tools.skills_linter import (
-        lint_skill,
-        has_errors as _lint_has_errors,
-        format_lint_report as _format_lint_report,
-    )
-    _LINTER_AVAILABLE = True
-except ImportError:
-    _LINTER_AVAILABLE = False
-
-# ── Skills SAST — static security analysis on create/edit/patch ────────────
-try:
-    from tools.skills_sast import (
-        scan_skill as _sast_scan_skill,
-        has_errors as _sast_has_errors,
-        format_report as _sast_format_report,
-    )
-    _SAST_AVAILABLE = True
-except ImportError:
-    _SAST_AVAILABLE = False
-
-# ── History snapshots for skill_manage operations ─────────────────────────
-from hermes_cli.history import snapshot_before, snapshot_after
-
 logger = logging.getLogger(__name__)
 
 _background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
@@ -786,14 +761,12 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
     Uses a temporary file in the same directory and os.replace() to ensure
     the target file is never left in a partially-written state if the process
     crashes or is interrupted.
-
+    
     Args:
         file_path: Target file path
         content: Content to write
         encoding: Text encoding (default: utf-8)
     """
-    # Snapshot before write (if file already exists)
-    sid = snapshot_before(str(file_path), operation="skill_manage")
     file_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(
         dir=str(file_path.parent),
@@ -811,82 +784,6 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
         except OSError:
             logger.error("Failed to remove temporary file %s during atomic write", temp_path, exc_info=True)
         raise
-    # Snapshot after successful write
-    snapshot_after(str(file_path), sid, operation="skill_manage")
-
-
-# =============================================================================
-# Helpers — lint & SAST
-# =============================================================================
-
-
-def _run_lint_check(
-    content: str,
-    skill_dir: Optional[Path] = None,
-    skill_name: Optional[str] = None,
-    action_label: str = "write",
-) -> Optional[Dict[str, Any]]:
-    """Run skills linter on content.
-
-    Returns an error dict (success=False) if lint errors are found, or None
-    if the content passes (or the linter is unavailable).
-
-    Warnings do NOT block the write — only errors do.
-    """
-    if not _LINTER_AVAILABLE:
-        return None
-    try:
-        issues = lint_skill(content, skill_dir=skill_dir, skill_name=skill_name)
-        if _lint_has_errors(issues):
-            report = _format_lint_report(issues)
-            return {
-                "success": False,
-                "error": (
-                    f"Cannot {action_label} skill: lint validation failed. "
-                    f"Fix the errors below and retry:\n\n{report}"
-                ),
-            }
-    except Exception as e:
-        logger.warning("Skills linter failed during %s: %s", action_label, e, exc_info=True)
-    return None
-
-
-def _run_sast_scan(
-    content: str,
-    skill_name: Optional[str] = None,
-    action_label: str = "write",
-) -> Optional[Dict[str, Any]]:
-    """Run SAST (static security analysis) on skill content.
-
-    Returns an error dict (success=False) if critical or high severity issues
-    are found, or None if the content passes security checks (or the scanner
-    is unavailable).
-
-    Medium/low issues are reported via logger.warning but do NOT block.
-    """
-    if not _SAST_AVAILABLE:
-        return None
-    try:
-        issues = _sast_scan_skill(content, skill_name=skill_name)
-        if _sast_has_errors(issues):
-            report = _sast_format_report(issues)
-            return {
-                "success": False,
-                "error": (
-                    f"Cannot {action_label} skill: security validation failed. "
-                    f"Fix the issues below and retry:\n\n{report}"
-                ),
-            }
-        # Medium/low issues are advisory only — log them but don't block
-        if issues:
-            report = _sast_format_report(issues)
-            logger.warning(
-                "SAST advisory for skill '%s' during %s:\n%s",
-                skill_name or "<unknown>", action_label, report,
-            )
-    except Exception as e:
-        logger.warning("Skills SAST failed during %s: %s", action_label, e, exc_info=True)
-    return None
 
 
 # =============================================================================
@@ -899,16 +796,6 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     err = _validate_name(name)
     if err:
         return {"success": False, "error": err}
-
-    # Lint validation
-    lint_err = _run_lint_check(content, skill_name=name, action_label="create")
-    if lint_err:
-        return lint_err
-
-    # SAST scan (security) — after lint
-    sast_err = _run_sast_scan(content, skill_name=name, action_label="create")
-    if sast_err:
-        return sast_err
 
     err = _validate_category(category)
     if err:
@@ -980,16 +867,6 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     err = _validate_content_size(content)
     if err:
         return {"success": False, "error": err}
-
-    # Lint validation
-    lint_err = _run_lint_check(content, skill_name=name, action_label="edit")
-    if lint_err:
-        return lint_err
-
-    # SAST scan (security) — after lint
-    sast_err = _run_sast_scan(content, skill_name=name, action_label="edit")
-    if sast_err:
-        return sast_err
 
     existing = _find_skill(name)
     if not existing:
@@ -1125,22 +1002,6 @@ def _patch_skill(
                 "success": False,
                 "error": f"Patch would break SKILL.md structure: {err}",
             }
-
-        # Lint validation for SKILL.md patches
-        skill_dir = existing["path"]
-        lint_err = _run_lint_check(
-            new_content,
-            skill_dir=skill_dir,
-            skill_name=name,
-            action_label="patch",
-        )
-        if lint_err:
-            return lint_err
-
-        # SAST scan (security) — after lint (SKILL.md patches only)
-        sast_err = _run_sast_scan(new_content, skill_name=name, action_label="patch")
-        if sast_err:
-            return sast_err
 
     original_content = content  # for rollback
     _atomic_write_text(target, new_content)
@@ -1309,14 +1170,6 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         )
         if read_guard:
             return read_guard
-
-    # Lint validation when writing SKILL.md
-    target_is_skill_md = file_path in ("SKILL.md", f"{name}/SKILL.md") or Path(file_path).name == "SKILL.md"
-    if target_is_skill_md:
-        lint_err = _run_lint_check(file_content, skill_name=name, action_label="write_file")
-        if lint_err:
-            return lint_err
-
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None

@@ -12850,35 +12850,6 @@ def main():
     moa_parser.set_defaults(func=cmd_moa)
 
     # =========================================================================
-    # history command — .hermes-history time-travel snapshots
-    # =========================================================================
-    from hermes_cli.history_cmd import cmd_history
-
-    history_parser = subparsers.add_parser(
-        "history",
-        help="Manage .hermes-history snapshots (time travel)",
-        description="List, diff, rollback, and prune automatic file snapshots",
-    )
-    history_sub = history_parser.add_subparsers(dest="history_command")
-
-    history_list = history_sub.add_parser("list", help="List recent snapshots")
-    history_list.add_argument("--limit", type=int, default=20, help="Max snapshots to show")
-
-    history_diff = history_sub.add_parser("diff", help="Show unified diff for a snapshot")
-    history_diff.add_argument("snapshot_id", help="Snapshot ID (e.g. 20260705-121220-573603)")
-
-    history_cat = history_sub.add_parser("cat", help="Show raw meta.json for a snapshot")
-    history_cat.add_argument("snapshot_id", help="Snapshot ID")
-
-    history_roll = history_sub.add_parser("rollback", help="Restore files from a snapshot")
-    history_roll.add_argument("snapshot_id", help="Snapshot ID")
-
-    history_prune = history_sub.add_parser("prune", help="Remove old snapshots")
-    history_prune.add_argument("--keep", type=int, default=50, help="Snapshots to keep (default: 50)")
-
-    history_parser.set_defaults(func=cmd_history)
-
-    # =========================================================================
     # fallback command — manage the fallback provider chain
     # =========================================================================
     from hermes_cli.fallback_cmd import cmd_fallback

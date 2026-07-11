@@ -400,24 +400,6 @@ def _normalize_string_set(values) -> Set[str]:
     return {str(v).strip() for v in values if str(v).strip()}
 
 
-def get_hidden_from_index_names() -> Set[str]:
-    """Read skill names hidden from the index but still loadable via skill_view.
-
-    Reads ``skills.hide_from_index`` from config.yaml. Unlike
-    ``disabled``, hidden skills are fully functional — they simply
-    don't appear in the ``<available_skills>`` block of the system
-    prompt. Use this for skills you rarely use but want to keep
-    loadable on demand.
-    """
-    parsed = _load_raw_config()
-    if not parsed:
-        return set()
-    skills_cfg = parsed.get("skills")
-    if not isinstance(skills_cfg, dict):
-        return set()
-    return _normalize_string_set(skills_cfg.get("hide_from_index"))
-
-
 # ── External skills directories ──────────────────────────────────────────
 
 # (config_path_str, mtime_ns) -> resolved external dirs list.  Keyed by
