@@ -52,6 +52,7 @@ import type {
   SkillInfo,
   StarmapGraph,
   StatusResponse,
+  TerminalBackendsResponse,
   ToolsetConfig,
   ToolsetInfo,
   ToolsetModelsResponse
@@ -356,6 +357,62 @@ export async function listAllProfileSessions(
     ...result,
     sessions: result.sessions.slice(0, limit),
     offset: 0
+  }
+}
+
+// Batched sidebar slices in one request: recents (scoped to the active profile),
+// cron, and messaging. The backend opens each profile's state.db once and runs
+// all three filtered queries, replacing three separate listAllProfileSessions
+// calls that each reopened + re-counted every profile DB per refresh. Electron
+// splices remote profiles per slice (see interceptSessionRequestForRemote).
+export interface SidebarSessionSlice {
+  sessions: SessionInfo[]
+  total?: number
+  profile_totals?: Record<string, number>
+}
+
+export interface SidebarSessionsResponse {
+  recents: SidebarSessionSlice
+  cron: SidebarSessionSlice
+  messaging: SidebarSessionSlice
+  errors?: Array<{ profile: string; error: string }>
+}
+
+export interface SidebarSessionsRequest {
+  recentsProfile: 'all' | (string & {})
+  recentsLimit: number
+  recentsExclude: string[]
+  cronLimit: number
+  messagingLimit: number
+  messagingExclude: string[]
+}
+
+export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<SidebarSessionsResponse> {
+  const params = new URLSearchParams({
+    recents_profile: req.recentsProfile,
+    recents_limit: String(Math.max(1, req.recentsLimit)),
+    cron_limit: String(Math.max(1, req.cronLimit)),
+    messaging_limit: String(Math.max(1, req.messagingLimit))
+  })
+
+  if (req.recentsExclude.length) {
+    params.set('recents_exclude', req.recentsExclude.join(','))
+  }
+
+  if (req.messagingExclude.length) {
+    params.set('messaging_exclude', req.messagingExclude.join(','))
+  }
+
+  const result = await window.hermesDesktop.api<SidebarSessionsResponse>({
+    path: `/api/profiles/sessions/sidebar?${params.toString()}`,
+    timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
+  })
+
+  return {
+    recents: { ...result.recents, sessions: result.recents?.sessions ?? [] },
+    cron: { ...result.cron, sessions: result.cron?.sessions ?? [] },
+    messaging: { ...result.messaging, sessions: result.messaging?.sessions ?? [] },
+    errors: result.errors
   }
 }
 
@@ -824,6 +881,22 @@ export function runToolsetPostSetup(name: string, key: string): Promise<ActionRe
     path: `/api/tools/toolsets/${encodeURIComponent(name)}/post-setup`,
     method: 'POST',
     body: { key }
+  })
+}
+
+export function getTerminalBackends(): Promise<TerminalBackendsResponse> {
+  return window.hermesDesktop.api<TerminalBackendsResponse>({
+    ...profileScoped(),
+    path: '/api/tools/terminal/backends'
+  })
+}
+
+export function selectTerminalBackend(backend: string): Promise<{ ok: boolean; backend: string }> {
+  return window.hermesDesktop.api<{ ok: boolean; backend: string }>({
+    ...profileScoped(),
+    path: '/api/tools/terminal/backend',
+    method: 'PUT',
+    body: { backend }
   })
 }
 

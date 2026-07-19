@@ -1165,6 +1165,13 @@ DEFAULT_CONFIG = {
         # default is 1800s) plus runtime slack.  Set to 0 to disable the
         # gate and restore pre-fix behaviour (always inject).
         "gateway_auto_continue_freshness": 3600,
+        # Stale-stream ceiling for local providers (Ollama, oMLX, llama-cpp) in
+        # seconds. When the base stale timeout is at its default (180s) and a
+        # local endpoint is detected, this finite ceiling replaces the former
+        # infinite disable so a wedged local server eventually trips the
+        # detector instead of hanging forever. The env var
+        # ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch use.
+        "local_stream_stale_timeout": 900,
         # How user-attached images are presented to the main model on each turn.
         #   "auto"   — attach natively when the active model reports
         #              supports_vision=True AND the user hasn't explicitly
@@ -1297,6 +1304,7 @@ DEFAULT_CONFIG = {
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
+        "headed": False,  # Local mode: launch Chromium with a visible window (also skips per-turn cleanup so the window persists between turns; idle reaper still applies)
         "allow_private_urls": False,  # Allow navigating to private/internal IPs (localhost, 192.168.x.x, etc.)
         # Browser engine for local mode.  Passed as ``--engine <value>`` to
         # agent-browser v0.25.3+.
@@ -2524,7 +2532,22 @@ DEFAULT_CONFIG = {
         "bots_require_inline_mention": False,  # Multi-bot rooms: if True, another bot must type @thisbot in its message to trigger a reply; a Discord reply/quote alone won't. Prevents two bots auto-replying to each other forever. Does not affect humans.
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
+        "missed_message_backfill": {
+            "enabled": False,             # Replay missed Discord messages after reconnect/startup
+            "channels": "",               # Comma-separated channel IDs; empty uses free_response_channels
+            "window_seconds": 21600,      # Only inspect messages from the last 6 hours
+            "limit": 100,                 # Global cap on messages scanned per reconnect
+            "max_dispatches": 10,         # Cap on recovered messages dispatched per reconnect
+        },
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
+        # Discord Gateway transport health. These settings inspect the active
+        # WebSocket's ready/open/heartbeat state; they never use Discord REST as
+        # proof that Gateway events are still arriving. Set any value to 0 to
+        # disable this compatibility-safe probe during a rollback.
+        "websocket_liveness_interval_seconds": 15,
+        "websocket_liveness_failure_threshold": 2,
+        "websocket_heartbeat_ack_max_age_seconds": 60,
+        "websocket_max_latency_seconds": 30,
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
         # Opt-in DM role-based auth (#12136). By default, DISCORD_ALLOWED_ROLES
         # authorizes only guild messages in the role's own guild — DMs require
@@ -2941,6 +2964,15 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Durable delivery-obligation ledger: final agent responses are
+        # recorded in state.db around the platform send, and a gateway that
+        # died between finalize and platform ACK redelivers the stored
+        # response on the next boot (ambiguous cases carry a visible
+        # "recovered reply — may be a duplicate" marker; honest
+        # at-least-once). Disable to lose in-flight final responses on
+        # crash/restart, as before.
+        "delivery_ledger": True,
+
         # Seconds the gateway waits for a single messaging platform to finish
         # connecting during startup (and on reconnect). Discord in particular
         # can blow past the old fixed 30s when an account has many slash
@@ -2986,6 +3018,19 @@ DEFAULT_CONFIG = {
         "restart_loop_guard": {
             "max_restarts": 3,
             "window_seconds": 60,
+        },
+
+        # Portable respawn-storm circuit breaker (complements
+        # ``restart_loop_guard`` above). Counts gateway (re)starts in a sliding
+        # window and, when too many land, sleeps an exponential backoff before
+        # booting so a crash-looping supervisor (launchd KeepAlive, systemd
+        # Restart=always) can't hammer the process into a respawn storm.
+        # ``max_starts <= 0`` disables the breaker. The env vars
+        # ``HERMES_GATEWAY_MAX_STARTS`` / ``HERMES_GATEWAY_START_WINDOW_S``
+        # override these defaults for escape-hatch use.
+        "respawn_storm": {
+            "max_starts": 5,
+            "window_seconds": 120,
         },
 
         # Inject a human-readable timestamp prefix (e.g.
@@ -5448,14 +5493,31 @@ def check_config_version() -> Tuple[int, int]:
 # Config structure validation
 # =============================================================================
 
-# Fields that are valid at root level of config.yaml
-_KNOWN_ROOT_KEYS = {
-    "_config_version", "model", "providers", "fallback_model",
-    "fallback_providers", "credential_pool_strategies", "toolsets",
-    "agent", "terminal", "display", "compression", "delegation",
-    "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mcp_servers",
+# Fields that are valid at root level of config.yaml.
+# DEFAULT_CONFIG is the single source of truth for documented roots; keep this
+# set derived so new defaults (skills, security, browser, …) are accepted
+# automatically. A few optional/legacy roots are valid on disk but intentionally
+# absent from DEFAULT_CONFIG (omitted when unused / alternate schema forms).
+_EXTRA_KNOWN_ROOT_KEYS = {
+    "custom_providers",  # legacy list form; modern equivalent is providers: {}
+    "fallback_model",    # optional single dict or chain list; omitted when disabled
+    "mcp_servers",       # MCP server definitions written by setup/tools flows
+    # Roots read from the raw user YAML (or written by our own flows) that are
+    # intentionally absent from DEFAULT_CONFIG:
+    "image_gen",         # image-generation provider config (agent/image_gen_registry.py)
+    "video_gen",         # video-generation provider config (agent/video_gen_registry.py)
+    "plugins",           # plugin enable/disable lists (hermes_cli/plugins_cmd.py)
+    "smart_model_routing",   # written by the setup wizard (hermes_cli/setup.py)
+    "platform_toolsets",     # written by the setup wizard (hermes_cli/setup.py)
+    "session_reset",         # top-level form read by gateway/config.py + setup
+    "multiplex_profiles",    # top-level form accepted alongside gateway.multiplex_profiles
+    "profile_routes",        # top-level form accepted alongside gateway.profile_routes
+    "platforms",             # top-level per-platform map merged by gateway/config.py
+    "require_mention",       # top-level convenience form honored by the gateway (#3979)
+    "unauthorized_dm_behavior",  # top-level form read by gateway/config.py
+    "signal",            # Signal settings bridged to env vars by gateway/config.py
 }
+_KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 
 # Valid fields inside a custom_providers list entry
 _VALID_CUSTOM_PROVIDER_FIELDS = {
@@ -5610,15 +5672,27 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             "    base_url: https://...",
         ))
 
-    # ── Root-level keys that look misplaced ──────────────────────────────
+    # ── Unknown / misplaced root-level keys ──────────────────────────────
+    # Typos like skillz:/secrity: were previously silent (only provider-like
+    # fields were flagged). Warn on any unknown top-level key so config
+    # hygiene surfaces without breaking startup.
     for key in config:
         if key.startswith("_"):
             continue
-        if key not in _KNOWN_ROOT_KEYS and key in _CUSTOM_PROVIDER_LIKE_FIELDS:
+        if key in _KNOWN_ROOT_KEYS:
+            continue
+        if key in _CUSTOM_PROVIDER_LIKE_FIELDS:
             issues.append(ConfigIssue(
                 "warning",
                 f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                 f"Move '{key}' under the appropriate section",
+            ))
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"Unknown top-level config key '{key}' — it will be ignored",
+                "Check for typos, or remove the key if it is not a supported config root. "
+                "Run 'hermes doctor' for more detail.",
             ))
 
     return issues
@@ -7793,11 +7867,16 @@ def _quote_env_value(value: str) -> str:
     """Quote .env values containing characters with special dotenv meaning."""
     if value == "":
         return value
+    # Internal whitespace (space/tab/etc.) must be quoted so shell `set -a; . file`
+    # word-splits don't break paths like macOS "Application Support". Leading/
+    # trailing whitespace is already covered by the strip check; any() covers
+    # internal runs that strip() would leave alone.
     needs_quoting = (
         "#" in value
         or '"' in value
         or "'" in value
         or value != value.strip()
+        or any(c.isspace() for c in value)
     )
     if not needs_quoting:
         return value
